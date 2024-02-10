@@ -42,7 +42,7 @@ async fn run(window: Window, event_loop: EventLoop<()>) -> Result<()> {
         backends: Backends::all(),
         ..Default::default()
     });
-    let surface = unsafe { instance.create_surface(&window) }?;
+    let surface = instance.create_surface(&window)?;
     let adapter = instance
         .request_adapter(&RequestAdapterOptions {
             power_preference: PowerPreference::default(),
@@ -56,8 +56,9 @@ async fn run(window: Window, event_loop: EventLoop<()>) -> Result<()> {
         .request_device(
             &DeviceDescriptor {
                 label: None,
-                features: Features::empty(),
-                limits: Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()),
+                required_features: Features::empty(),
+                required_limits: Limits::downlevel_webgl2_defaults()
+                    .using_resolution(adapter.limits()),
             },
             None,
         )
@@ -160,42 +161,22 @@ async fn run(window: Window, event_loop: EventLoop<()>) -> Result<()> {
                 },
                 count: None,
             },
-            BindGroupLayoutEntry {
-                binding: 2,
-                visibility: ShaderStages::VERTEX,
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: BufferSize::new(4 * 4 * 4),
-                },
-                count: None,
-            },
         ],
     });
 
-    let depth_format = TextureFormat::Depth32Float;
+    let depth_format = TextureFormat::Depth24Plus;
 
     let mut size = window.inner_size();
     size.width = size.width.max(1);
     size.height = size.height.max(1);
     let swapchain_capabilities = surface.get_capabilities(&adapter);
     let swapchain_format = swapchain_capabilities.formats[0];
-    let mut config = SurfaceConfiguration {
-        usage: TextureUsages::RENDER_ATTACHMENT,
-        format: swapchain_format,
-        width: size.width,
-        height: size.height,
-        present_mode: PresentMode::Fifo,
-        alpha_mode: swapchain_capabilities.alpha_modes[0],
-        view_formats: vec![],
-    };
+    let mut config = surface.get_default_config(&adapter, size.width, size.height).unwrap();
     surface.configure(&device, &config);
 
     let shader = device.create_shader_module(ShaderModuleDescriptor {
         label: None,
-        source: ShaderSource::Wgsl(Cow::Borrowed(
-            &std::fs::read_to_string("src/shader.wgsl").expect("error reading file"),
-        )),
+        source: ShaderSource::Wgsl(Cow::Borrowed(include_str!("shader.wgsl"))),
     });
 
     let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
@@ -231,28 +212,19 @@ async fn run(window: Window, event_loop: EventLoop<()>) -> Result<()> {
         multiview: None,
     });
 
-    let camera_matrix = glam::Mat4::IDENTITY;
-    let camera_matrix_ref: &[f32; 16] = camera_matrix.as_ref();
-    let camera_buffer = device.create_buffer_init(&util::BufferInitDescriptor {
-        label: Some("Camera buffer"),
-        contents: bytemuck::cast_slice(camera_matrix_ref),
+    let mvp_matrix = glam::Mat4::IDENTITY;
+    let mvp_matrix_ref: &[f32; 16] = mvp_matrix.as_ref();
+    let mvp_buffer = device.create_buffer_init(&util::BufferInitDescriptor {
+        label: Some("MVP buffer"),
+        contents: bytemuck::cast_slice(mvp_matrix_ref),
         usage: BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
 
-    let model_matrix = glam::Mat4::from_rotation_y(0.8);
+    let model_matrix = glam::Mat4::IDENTITY;
     let model_matrix_ref: &[f32; 16] = model_matrix.as_ref();
     let model_buffer = device.create_buffer_init(&util::BufferInitDescriptor {
         label: Some("Model buffer"),
         contents: bytemuck::cast_slice(model_matrix_ref),
-        usage: BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-    });
-
-    //let normal_matrix = glam::Mat3::from_mat4(model_matrix.transpose().inverse());
-    let normal_matrix = Mat4::from_mat3(Mat3::from_mat4(model_matrix.transpose().inverse()));
-    let normal_matrix_ref: &[f32; 16] = normal_matrix.as_ref();
-    let normal_buffer = device.create_buffer_init(&util::BufferInitDescriptor {
-        label: Some("Normal buffer"),
-        contents: bytemuck::cast_slice(normal_matrix_ref),
         usage: BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
 
@@ -261,15 +233,11 @@ async fn run(window: Window, event_loop: EventLoop<()>) -> Result<()> {
         entries: &[
             BindGroupEntry {
                 binding: 0,
-                resource: camera_buffer.as_entire_binding(),
+                resource: mvp_buffer.as_entire_binding(),
             },
             BindGroupEntry {
                 binding: 1,
                 resource: model_buffer.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 2,
-                resource: normal_buffer.as_entire_binding(),
             },
         ],
         label: None,
@@ -280,7 +248,9 @@ async fn run(window: Window, event_loop: EventLoop<()>) -> Result<()> {
 
     let start = web_time::Instant::now();
 
+
     event_loop.run(move |event, elwt| {
+        let _ = (&instance, &adapter, &shader, &pipeline_layout);
         match event {
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
@@ -312,7 +282,8 @@ async fn run(window: Window, event_loop: EventLoop<()>) -> Result<()> {
         };
 
         let time = start.elapsed().as_secs_f32();
-        let camera_matrix = glam::Mat4::perspective_rh(
+        let model_matrix = glam::Mat4::from_rotation_y(time);
+        let mvp_matrix =glam::Mat4::perspective_rh(
             1.57,
             (config.width as f32) / (config.height as f32),
             0.001,
@@ -321,17 +292,11 @@ async fn run(window: Window, event_loop: EventLoop<()>) -> Result<()> {
             vec3(1.0, 1.0, 1.0),
             vec3(0.0, 0.0, 0.0),
             vec3(0.0, 1.0, 0.0),
-        );
-        let model_matrix = glam::Mat4::from_rotation_y(time);
-        let camera_matrix_ref: &[f32; 16] = camera_matrix.as_ref();
+        ) * model_matrix;
+        let mvp_matrix_ref: &[f32; 16] = mvp_matrix.as_ref();
         let model_matrix_ref: &[f32; 16] = model_matrix.as_ref();
-        queue.write_buffer(&camera_buffer, 0, bytemuck::cast_slice(camera_matrix_ref));
+        queue.write_buffer(&mvp_buffer, 0, bytemuck::cast_slice(mvp_matrix_ref));
         queue.write_buffer(&model_buffer, 0, bytemuck::cast_slice(model_matrix_ref));
-
-        //let normal_matrix = glam::Mat3::from_mat4(model_matrix.transpose().inverse());
-        let normal_matrix = Mat4::from_mat3(Mat3::from_mat4(model_matrix.transpose().inverse()));
-        let normal_matrix_ref: &[f32; 16] = normal_matrix.as_ref();
-        queue.write_buffer(&normal_buffer, 0, bytemuck::cast_slice(normal_matrix_ref));
 
         let frame = surface
             .get_current_texture()
@@ -365,11 +330,15 @@ async fn run(window: Window, event_loop: EventLoop<()>) -> Result<()> {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            rpass.push_debug_group("Preparing for draw");
             rpass.set_pipeline(&render_pipeline);
             rpass.set_bind_group(0, &bind_group, &[]);
             rpass.set_index_buffer(index_buffer.slice(..), IndexFormat::Uint16);
             rpass.set_vertex_buffer(0, vertex_buffer.slice(..));
+            rpass.pop_debug_group();
+            rpass.insert_debug_marker("Draw");
             rpass.draw_indexed(0..indices.len() as u32, 0, 0..1);
+            //rpass.draw(0..3, 0..1);
         }
 
         queue.submit(Some(encoder.finish()));
@@ -377,14 +346,57 @@ async fn run(window: Window, event_loop: EventLoop<()>) -> Result<()> {
     })?;
     Ok(())
 }
-
-fn main() -> Result<()> {
-    env_logger::init();
-    let event_loop = EventLoop::new()?;
-    let window = WindowBuilder::new().build(&event_loop)?;
+async fn real_run(window: Window, event_loop: EventLoop<()>) {
+    let result = run(window, event_loop).await;
+    if let Err(e) = result {
+        panic!("error running app: {}", e);
+    }
+}
+// #[cfg(target_arch="wasm32")]
+// pub fn hook(info: &std::panic::PanicInfo) {
+//     let message = format!("panic occurred: {info}");
+//     let _  = web_sys::window().unwrap().alert_with_message(&message);
+// }
+#[cfg(target_arch="wasm32")]
+use wasm_bindgen::prelude::*;
+#[wasm_bindgen(start)]
+pub fn main() {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        env_logger::init();
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        std::panic::set_hook(Box::new(console_error_panic_hook::hook));
+        console_log::init().expect("failed to initialize logger");
+    }
+    let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
+    #[allow(unused_mut)]
+    let mut builder = WindowBuilder::new();
+    
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen::JsCast;
+        use winit::platform::web::WindowBuilderExtWebSys;
+        let canvas = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .get_element_by_id("canvas")
+            .unwrap()
+            .dyn_into::<web_sys::HtmlCanvasElement>()
+            .unwrap();
+        builder = builder.with_canvas(Some(canvas));
+    }
+    let window = builder.build(&event_loop).unwrap();
 
-    pollster::block_on(run(window, event_loop))?;
-
-    Ok(())
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        pollster::block_on(real_run(window, event_loop));
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_bindgen_futures::spawn_local(real_run(window, event_loop));
+    }
 }
